@@ -20,9 +20,6 @@ const ibl_suffix = Filament.getSupportedFormatSuffix('etc s3tc');
 const albedo_suffix = Filament.getSupportedFormatSuffix('astc s3tc');
 const texture_suffix = Filament.getSupportedFormatSuffix('etc');
 
-const env = 'syferfontein_18d_clear_2k'
-const ibl_url = `${env}/${env}_ibl${ibl_suffix}.ktx`;
-const sky_url = `${env}/${env}_skybox.ktx`;
 const albedo_url = `albedo${albedo_suffix}.ktx`;
 const ao_url = `ao${texture_suffix}.ktx`;
 const metallic_url = `metallic${texture_suffix}.ktx`;
@@ -38,9 +35,7 @@ Filament.init([
     ao_url,
     metallic_url,
     normal_url,
-    roughness_url,
-    ibl_url,
-    sky_url
+    roughness_url
 ], () => {
     window.VertexAttribute = Filament.VertexAttribute;
     window.AttributeType = Filament.VertexBuffer$AttributeType;
@@ -57,24 +52,22 @@ class App {
         const engine = this.engine = Filament.Engine.create(this.canvas);
         this.scene = engine.createScene();
 
-        const sunlight = Filament.EntityManager.get().create();
-        Filament.LightManager.Builder(LightType.SUN)
-            .color([0.98, 0.92, 0.89])
-            .intensity(100000.0)
-            .direction([0.6, -1.0, -0.8])
-            .castShadows(true)
-            .sunAngularRadius(1.9)
-            .sunHaloSize(10.0)
-            .sunHaloFalloff(80.0)
-            .build(engine, sunlight);
-        this.scene.addEntity(sunlight);
-
-        const indirectLight = this.ibl = engine.createIblFromKtx(ibl_url);
-        this.scene.setIndirectLight(indirectLight);
-        indirectLight.setIntensity(100000);
-
-        const skybox = engine.createSkyFromKtx(sky_url);
-        this.scene.setSkybox(skybox);
+        const l1 = Filament.EntityManager.get().create();
+        const l2 = Filament.EntityManager.get().create();
+        Filament.LightManager.Builder(LightType.POINT)
+            .color([1, 0, 0])
+            .intensity(10000000.0)
+            .position([-1, 0, 10])
+            .falloff(1000)
+            .build(engine, l1);
+        Filament.LightManager.Builder(LightType.POINT)
+            .color([0, 1, 0])
+            .intensity(10000000.0)
+            .position([1, 0, 10])
+            .falloff(1000)
+            .build(engine, l2);
+        this.scene.addEntity(l1);
+        this.scene.addEntity(l2);
 
         const material = engine.createMaterial(filamat_url);
         const matinstance = material.createInstance();
@@ -106,6 +99,7 @@ class App {
         this.view = engine.createView();
         this.view.setCamera(this.camera);
         this.view.setScene(this.scene);
+        this.view.setClearColor([0,0.5,0.5,1]);
         this.resize();
         this.render = this.render.bind(this);
         this.resize = this.resize.bind(this);
