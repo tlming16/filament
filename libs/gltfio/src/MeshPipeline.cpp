@@ -47,6 +47,7 @@ struct BakedPrim {
     const cgltf_node* sourceNode;
     const cgltf_mesh* sourceMesh;
     const cgltf_primitive* sourcePrimitive;
+    const cgltf_attribute* sourcePositions;
     float3* bakedPositions;
     uint32_t* bakedIndices;
     float3 bakedMin;
@@ -107,17 +108,6 @@ private:
     } mStorage;
 };
 
-// Performs in-place mutation of a cgltf primitive to ensure that the POSITION attribute is the
-// first item in its list of attributes, which makes life easier for pipeline operations.
-void movePositionAttribute(cgltf_primitive* prim) {
-    for (cgltf_size i = 0; i < prim->attributes_count; ++i) {
-        if (prim->attributes[i].type == cgltf_attribute_type_position) {
-            std::swap(prim->attributes[i], prim->attributes[0]);
-            return;
-        }
-    }
-}
-
 // Returns true if the given cgltf asset has been flattened by the mesh pipeline and is therefore
 // amenable to subsequent pipeline operations like baking and exporting.
 bool isFlattened(const cgltf_data* asset) {
@@ -136,12 +126,11 @@ bool Pipeline::filterPrim(const cgltf_primitive& prim) {
     if (filterTriangles && prim.type != cgltf_primitive_type_triangles) {
         return false;
     }
-    const cgltf_attribute* pos = prim.attributes_count ? prim.attributes : nullptr;
-    if (!pos || !pos->data || !pos->data->count) {
-        return false;
-    }
-    if (pos->data->is_sparse) {
-        return false;
+    for (cgltf_size k = 0; k < prim.attributes_count; ++k) {
+        const cgltf_attribute& attr = prim.attributes[k];
+        if (!attr.data || !attr.data->count || attr.data->is_sparse) {
+            return false;
+        }
     }
     if (!prim.indices || prim.indices->is_sparse) {
         // TODO: generate trivial indices
@@ -262,13 +251,13 @@ const cgltf_data* Pipeline::flattenBuffers(const cgltf_data* sourceAsset) {
         auto& t4 = material.normal_texture.texture;
         auto& t5 = material.occlusion_texture.texture;
         auto& t6 = material.emissive_texture.texture;
-        t0 = textures + (t0 - sourceAsset->textures);
-        t1 = textures + (t1 - sourceAsset->textures);
-        t2 = textures + (t2 - sourceAsset->textures);
-        t3 = textures + (t3 - sourceAsset->textures);
-        t4 = textures + (t4 - sourceAsset->textures);
-        t5 = textures + (t5 - sourceAsset->textures);
-        t6 = textures + (t6 - sourceAsset->textures);
+        t0 = t0 ? textures + (t0 - sourceAsset->textures) : nullptr;
+        t1 = t1 ? textures + (t1 - sourceAsset->textures) : nullptr;
+        t2 = t2 ? textures + (t2 - sourceAsset->textures) : nullptr;
+        t3 = t3 ? textures + (t3 - sourceAsset->textures) : nullptr;
+        t4 = t4 ? textures + (t4 - sourceAsset->textures) : nullptr;
+        t5 = t5 ? textures + (t5 - sourceAsset->textures) : nullptr;
+        t6 = t6 ? textures + (t6 - sourceAsset->textures) : nullptr;
     }
 
     // Clone the meshes, primitives, and attributes.
@@ -313,9 +302,9 @@ const cgltf_data* Pipeline::flattenPrims(const cgltf_data* sourceAsset, uint32_t
 
     // This must be called after flattenBuffers.
     assert(sourceAsset->buffers_count == 1);
+    assert(sourceAsset->buffers[0].data != nullptr);
 
-    // Sanitize each attribute list such that POSITIONS is always the first entry.
-    // Also determine the number of primitives that will be baked.
+    // Determine the number of primitives and attributes that will be baked.
     size_t numPrims = 0;
     size_t numAttributes;
     for (cgltf_size i = 0; i < sourceAsset->nodes_count; ++i) {
@@ -323,7 +312,6 @@ const cgltf_data* Pipeline::flattenPrims(const cgltf_data* sourceAsset, uint32_t
         if (node.mesh) {
             for (cgltf_size j = 0; j < node.mesh->primitives_count; ++j) {
                 cgltf_primitive& sourcePrim = node.mesh->primitives[j];
-                movePositionAttribute(&sourcePrim);
                 if (filterPrim(sourcePrim)) {
                     numPrims++;
                     numAttributes += sourcePrim.attributes_count;
@@ -335,31 +323,43 @@ const cgltf_data* Pipeline::flattenPrims(const cgltf_data* sourceAsset, uint32_t
     bakedPrims.reserve(numPrims);
 
     // Count the total number of vertices and start filling in the BakedPrim structs.
-    int numVertices = 0, numIndices = 0;
+    int numPositions = 0, numIndices = 0, numAttributesBaked = 0;
     for (cgltf_size i = 0; i < sourceAsset->nodes_count; ++i) {
         const cgltf_node& node = sourceAsset->nodes[i];
         if (node.mesh) {
             for (cgltf_size j = 0; j < node.mesh->primitives_count; ++j) {
                 const cgltf_primitive& sourcePrim = node.mesh->primitives[j];
                 if (filterPrim(sourcePrim)) {
-                    numVertices += sourcePrim.attributes[0].data->count;
-                    numIndices += sourcePrim.indices->count;
-                    bakedPrims.push_back({
+                    BakedPrim bakedPrim {
                         .sourceNode = &node,
                         .sourceMesh = node.mesh,
                         .sourcePrimitive = &sourcePrim,
-                    });
+                    };
+                    for (cgltf_size k = 0; k < sourcePrim.attributes_count; ++k) {
+                        const cgltf_attribute& attr = sourcePrim.attributes[k];
+                        switch (attr.type) {
+                            case cgltf_attribute_type_position:
+                                numAttributesBaked++;
+                                numPositions += attr.data->count;
+                                bakedPrim.sourcePositions = &attr;
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+                    numIndices += sourcePrim.indices->count;
+                    bakedPrims.push_back(bakedPrim);
                 }
             }
         }
     }
 
     // Allocate a buffer large enough to hold vertex positions and indices.
-    const size_t vertexDataSize = sizeof(float3) * numVertices;
+    const size_t vertexDataSize = sizeof(float3) * numPositions;
     const size_t indexDataSize = sizeof(uint32_t) * numIndices;
     uint8_t* bufferData = mStorage.bufferData.alloc(vertexDataSize + indexDataSize);
-    float3* vertexData = (float3*) bufferData;
-    uint32_t* indexData = (uint32_t*) (bufferData + vertexDataSize);
+    float3* bakedPositions = (float3*) bufferData;
+    uint32_t* bakedIndices = (uint32_t*) (bufferData + vertexDataSize);
 
     // Next, perform the actual baking: convert all vertex positions to fp32, transform them by
     // their respective node matrix, etc.
@@ -372,18 +372,18 @@ const cgltf_data* Pipeline::flattenPrims(const cgltf_data* sourceAsset, uint32_t
             cgltf_node_transform_world(node, &matrix[0][0]);
         }
         const cgltf_primitive* sourcePrim = bakedPrim.sourcePrimitive;
-        bakedPrim.bakedPositions = vertexData;
-        bakedPrim.bakedIndices = indexData;
-        vertexData += sourcePrim->attributes[0].data->count;
-        indexData += sourcePrim->indices->count;
+        bakedPrim.bakedPositions = bakedPositions;
+        bakedPrim.bakedIndices = bakedIndices;
+        bakedPositions += bakedPrim.sourcePositions->data->count;
+        bakedIndices += sourcePrim->indices->count;
         bakeTransform(&bakedPrim, matrix);
     }
 
-    // We'll keep all the buffer views and accessors from the source asset and add a new pair of
+    // We'll keep all the buffer views and accessors from the source asset and add new buffer views
     // views and accessors for each primitive: one for converted position data and one for converted
-    // index data.
-    size_t numBufferViews = sourceAsset->buffer_views_count + 2 * numPrims;
-    size_t numAccessors = sourceAsset->accessors_count + 2 * numPrims;
+    // and accessors for index buffers and baked attributes.
+    size_t numBufferViews = sourceAsset->buffer_views_count + numPrims + numAttributesBaked;
+    size_t numAccessors = sourceAsset->accessors_count + numPrims + numAttributesBaked;
 
     // Allocate memory for the various cgltf structures.
     cgltf_data* resultAsset = mStorage.resultAssets.alloc(1);
@@ -434,7 +434,7 @@ const cgltf_data* Pipeline::flattenPrims(const cgltf_data* sourceAsset, uint32_t
         cgltf_accessor& positionsAccessor = accessors[2 * primIndex + 1] = {
             .component_type = cgltf_component_type_r_32f,
             .type = cgltf_type_vec3,
-            .count = bakedPrim.sourcePrimitive->attributes[0].data->count,
+            .count = bakedPrim.sourcePositions->data->count,
             .buffer_view = views + primIndex * 2 + 1,
             .has_min = true,
             .has_max = true,
@@ -456,10 +456,13 @@ const cgltf_data* Pipeline::flattenPrims(const cgltf_data* sourceAsset, uint32_t
             .data = &positionsAccessor
         };
         size_t attrCount = bakedPrim.sourcePrimitive->attributes_count;
-        for (size_t j = 1; j < attrCount; ++j) {
-            auto& attr = attributes[attrIndex++] = bakedPrim.sourcePrimitive->attributes[j];
-            size_t accessorIndex = attr.data - sourceAsset->accessors;
-            attr.data = accessors + numPrims * 2 + accessorIndex;
+        for (size_t j = 0; j < attrCount; ++j) {
+            const auto& srcAttr = bakedPrim.sourcePrimitive->attributes[j];
+            if (srcAttr.type != cgltf_attribute_type_position) {
+                auto& attr = attributes[attrIndex++] = srcAttr;
+                size_t accessorIndex = attr.data - sourceAsset->accessors;
+                attr.data = accessors + numPrims * 2 + accessorIndex;
+            }
         }
 
         prims[primIndex] = {
@@ -535,7 +538,7 @@ const cgltf_data* Pipeline::flattenPrims(const cgltf_data* sourceAsset, uint32_t
 
 void Pipeline::bakeTransform(BakedPrim* prim, const mat4f& transform) {
     const cgltf_primitive* source = prim->sourcePrimitive;
-    const cgltf_attribute* sourcePositions = source->attributes;
+    const cgltf_attribute* sourcePositions = prim->sourcePositions;
     const size_t numVerts = sourcePositions->data->count;
 
     // Read position data, converting to float if necessary.
@@ -654,7 +657,11 @@ AssetHandle MeshPipeline::load(const utils::Path& fileOrDirectory) {
     impl->addSourceAsset(sourceAsset);
 
     // Load external resources.
-    cgltf_load_buffers(&options, sourceAsset, filename.c_str());
+    utils::Path abspath = filename.getAbsolutePath();
+    if (cgltf_load_buffers(&options, sourceAsset, abspath.c_str()) != cgltf_result_success) {
+        utils::slog.e << "Unable to load external buffers." << utils::io::endl;
+        exit(1);
+    }
 
     return sourceAsset;
 }
